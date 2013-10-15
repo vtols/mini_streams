@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #define alloc_t(T) ((T *) malloc(sizeof(T)))
 #define alloc(V) V = (typeof(V)) malloc(sizeof(typeof(*V)))
@@ -9,6 +10,8 @@
 typedef struct write_stream write_stream;
 typedef struct write_stream_operations write_stream_operations;
 typedef struct aggregator_stream_data aggregator_stream_data;
+typedef struct write_bit_stream write_bit_stream;
+typedef struct write_bit_stream_operations write_bit_stream_operations;
 
 struct write_stream_operations
 {
@@ -17,6 +20,13 @@ struct write_stream_operations
     void    (*write_str)(write_stream *self, char *s);
     void    (*write_int)(write_stream *self, int n);
     void    (*close)(write_stream *self);
+};
+
+struct write_bit_stream_operations
+{
+    void    (*open)();
+    void    (*write_bits)(write_bit_stream *self, uint32_t buf, size_t n);
+    void    (*close)(write_bit_stream *self);
 };
 
 struct write_stream
@@ -31,10 +41,26 @@ struct aggregator_stream_data
     write_stream **streams;
 };
 
+struct write_bit_stream
+{
+    write_stream *base;
+    uint64_t buffer;
+    size_t buffer_fill;
+    struct  write_bit_stream_operations *w_op;
+};
+
 write_stream *write_stream_new(write_stream_operations *stream_type)
 {
     write_stream *w = alloc_t(write_stream);
     w->data = NULL;
+    w->w_op = stream_type;
+    return w;
+}
+
+write_bit_stream *write_bit_stream_new(write_bit_stream_operations *stream_type)
+{
+    write_bit_stream *w = alloc_t(write_bit_stream);
+    w->buffer = w->buffer_fill = 0;
     w->w_op = stream_type;
     return w;
 }
@@ -126,12 +152,48 @@ void mem_write_stream_write(write_stream *self, char *s, size_t n)
     *(char *)(self->data) = '\0';
 }
 
+void default_write_bit_stream_open(write_bit_stream *self, write_stream *base)
+{
+    self->base = base;
+}
+
+void default_write_bit_stream_write_bits(write_bit_stream *self, uint32_t buf, size_t n)
+{
+    char wb[1];
+    
+    buf &= (1 << n) - 1;
+    
+    self->buffer = self->buffer | ((uint64_t) buf << self->buffer_fill);
+    self->buffer_fill += n;
+    
+    while (self->buffer_fill >= 8) {
+        self->buffer_fill -= 8;
+        *wb = self->buffer & 0xFF;
+        self->buffer = self->buffer >> 8;
+        self->base->w_op->write(self->base, wb, 1);
+    }
+}
+
+void default_write_bit_stream_close(write_bit_stream *self)
+{
+    char wb[1];
+    if (self->buffer) {
+        *wb = self->buffer;
+        self->base->w_op->write(self->base, wb, 1);
+    }
+}
+
 #define WRITE_STREAM_DEFAULTS \
         .open       = default_write_stream_open, \
         .write      = default_write_stream_write, \
         .write_str  = default_write_stream_write_str, \
         .write_int  = default_write_stream_write_int, \
         .close      = default_write_stream_close,
+        
+#define WRITE_BIT_STREAM_DEFAULTS \
+        .open       = default_write_bit_stream_open, \
+        .write_bits = default_write_bit_stream_write_bits, \
+        .close      = default_write_bit_stream_close,
 
 write_stream_operations dummy_stream =
 {
@@ -169,6 +231,11 @@ write_stream_operations mem_stream =
     .write      = mem_write_stream_write,
 };
 
+write_bit_stream_operations bit_stream = 
+{
+    WRITE_BIT_STREAM_DEFAULTS
+};
+
 #undef alloc_t
 #undef alloc
 
@@ -194,5 +261,22 @@ int main()
     agg->w_op->close(agg);
     puts("Memory:");
     puts(a);
+    
+    write_stream *z = write_stream_new(&mem_stream);
+    write_bit_stream *zb = write_bit_stream_new(&bit_stream);
+    
+    z->w_op->open(z, a);
+    zb->w_op->open(zb, z);
+    
+    char p = 'a';
+    i = 0;
+    
+    while (i < 32) {
+        zb->w_op->write_bits(zb, p & (1 << i) && 1, 1);
+        i++;
+    }
+    zb->w_op->close(zb);
+    printf("%d\n", a[0]);
+    
     return 0;
 }
